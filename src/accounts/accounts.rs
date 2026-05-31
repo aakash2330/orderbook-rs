@@ -1,5 +1,5 @@
 use super::super::{INITIAL_SYMBOLS, Order, OrderId, Price, Quantity, Side, Symbol, Trade, UserId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
 pub struct AccountsManager {
@@ -7,31 +7,16 @@ pub struct AccountsManager {
 }
 
 #[derive(Debug)]
-pub struct BalanceReservation {
-    pub symbol: Symbol,
-    pub price: Price,
-    pub side: Side,
-    pub quantity: Quantity,
-}
-
-#[derive(Debug)]
-pub struct PositionReservation {
-    pub symbol: Symbol,
-    pub side: Side,
-    pub quantity: Quantity,
-}
-
-#[derive(Debug)]
 pub struct UserAccount {
     pub balance: Price,
-    pub reservations: HashMap<OrderId, BalanceReservation>,
+    pub balance_reservations: HashSet<OrderId>,
     pub positions: HashMap<Symbol, UserPosition>,
 }
 
 #[derive(Debug)]
 pub struct UserPosition {
     pub quantity: Quantity,
-    pub reservations: HashMap<OrderId, PositionReservation>,
+    pub position_reservations: HashSet<OrderId>,
 }
 
 impl UserAccount {
@@ -46,7 +31,7 @@ impl UserAccount {
 
         UserAccount {
             balance: 0,
-            reservations: HashMap::new(),
+            balance_reservations: HashSet::new(),
             positions,
         }
     }
@@ -54,34 +39,18 @@ impl UserAccount {
     fn reserve_balance(&mut self, order: &Order) {
         let amount = order.price * order.remaining;
         self.balance -= amount;
-        let reservation = BalanceReservation {
-            symbol: order.symbol.clone(),
-            price: order.price,
-            side: order.side,
-            quantity: order.remaining,
-        };
-        self.reservations.insert(order.id, reservation);
+        self.balance_reservations.insert(order.id);
     }
 
     fn increase_balance(&mut self, amount: Price) {
         self.balance += amount;
     }
 
-    fn get_reservation(&self, order_id: OrderId) -> Result<&BalanceReservation, AccountsError> {
-        let Some(reserved) = self.reservations.get(&order_id) else {
+    fn has_balance_reservation(&self, order_id: OrderId) -> Result<(), AccountsError> {
+        if !self.balance_reservations.contains(&order_id) {
             return Err(AccountsError::UnknwonReservation);
         };
-        Ok(reserved)
-    }
-
-    fn get_reservation_mut(
-        &mut self,
-        order_id: OrderId,
-    ) -> Result<&mut BalanceReservation, AccountsError> {
-        let Some(reserved) = self.reservations.get_mut(&order_id) else {
-            return Err(AccountsError::UnknwonReservation);
-        };
-        Ok(reserved)
+        Ok(())
     }
 
     fn get_position(&self, symbol: Symbol) -> Result<&UserPosition, AccountsError> {
@@ -100,27 +69,21 @@ impl UserAccount {
 
     fn consume_reserved_balance(
         &mut self,
+        reserved_price: Price,
         match_price: Price,
         match_quantity: Quantity,
         order_id: OrderId,
+        order_fully_filled: bool,
     ) -> Result<(), AccountsError> {
-        let (refund_amount, should_remove) = {
-            let reserved = self.get_reservation_mut(order_id)?;
-            let amount_reserved_for_quantity = match_quantity * reserved.price;
-            let actual_amount_spent = match_quantity * match_price;
+        self.has_balance_reservation(order_id)?;
 
-            reserved.quantity -= match_quantity;
-            (
-                amount_reserved_for_quantity - actual_amount_spent,
-                reserved.quantity == 0,
-            )
-        };
-
+        let amount_reserved_for_quantity = match_quantity * reserved_price;
+        let actual_amount_spent = match_quantity * match_price;
+        let refund_amount = amount_reserved_for_quantity - actual_amount_spent;
         self.balance += refund_amount;
 
-        if should_remove {
-            //refund
-            self.reservations.remove(&order_id);
+        if order_fully_filled {
+            self.balance_reservations.remove(&order_id);
         }
 
         Ok(())
@@ -132,17 +95,12 @@ impl UserAccount {
         order_id: OrderId,
         match_price: Price,
         match_quantity: Quantity,
+        order_fully_filled: bool,
     ) -> Result<(), AccountsError> {
-        let should_remove = {
-            let position = self.get_position_mut(symbol.clone())?;
-            let reservation = position.get_reservation_mut(order_id)?;
+        let position = self.get_position_mut(symbol)?;
+        position.has_position_reservation(order_id)?;
 
-            reservation.quantity -= match_quantity;
-            reservation.quantity == 0
-        };
-
-        if should_remove {
-            let position = self.get_position_mut(symbol)?;
+        if order_fully_filled {
             position.remove_reservation(order_id);
         }
 
@@ -155,38 +113,23 @@ impl UserPosition {
     fn new() -> Self {
         UserPosition {
             quantity: 0,
-            reservations: HashMap::new(),
+            position_reservations: HashSet::new(),
         }
     }
     fn remove_reservation(&mut self, order_id: OrderId) {
-        self.reservations.remove(&order_id);
+        self.position_reservations.remove(&order_id);
     }
 
     fn reserve_position(&mut self, order: &Order) {
         self.quantity -= order.remaining;
-        let reservation = PositionReservation {
-            symbol: order.symbol.clone(),
-            side: order.side,
-            quantity: order.remaining,
-        };
-        self.reservations.insert(order.id, reservation);
+        self.position_reservations.insert(order.id);
     }
 
-    fn get_reservation(&self, order_id: OrderId) -> Result<&PositionReservation, AccountsError> {
-        let Some(reserved) = self.reservations.get(&order_id) else {
+    fn has_position_reservation(&self, order_id: OrderId) -> Result<(), AccountsError> {
+        if !self.position_reservations.contains(&order_id) {
             return Err(AccountsError::UnknwonReservation);
         };
-        Ok(reserved)
-    }
-
-    fn get_reservation_mut(
-        &mut self,
-        order_id: OrderId,
-    ) -> Result<&mut PositionReservation, AccountsError> {
-        let Some(reserved) = self.reservations.get_mut(&order_id) else {
-            return Err(AccountsError::UnknwonReservation);
-        };
-        Ok(reserved)
+        Ok(())
     }
 
     fn increase_position_quantity(&mut self, quantity: Quantity) {
@@ -231,11 +174,19 @@ impl AccountsManager {
         &mut self,
         user_id: UserId,
         order_id: OrderId,
+        reserved_price: Price,
         match_price: Price,
         match_quantity: Quantity,
+        order_fully_filled: bool,
     ) -> Result<(), AccountsError> {
         let user_account = self.get_user_account_mut(user_id)?;
-        user_account.consume_reserved_balance(match_price, match_quantity, order_id)?;
+        user_account.consume_reserved_balance(
+            reserved_price,
+            match_price,
+            match_quantity,
+            order_id,
+            order_fully_filled,
+        )?;
         Ok(())
     }
 
@@ -257,6 +208,7 @@ impl AccountsManager {
         order_id: OrderId,
         match_price: Price,
         match_quantity: Quantity,
+        order_fully_filled: bool,
     ) -> Result<(), AccountsError> {
         let account = self.get_user_account_mut(user_id)?;
         account.consume_reserved_position_quantity(
@@ -264,6 +216,7 @@ impl AccountsManager {
             order_id,
             match_price,
             match_quantity,
+            order_fully_filled,
         )?;
         Ok(())
     }
@@ -353,14 +306,36 @@ impl AccountsManager {
         Ok(())
     }
 
+    pub fn release_reserved_order(&mut self, order: &Order) -> Result<(), AccountsError> {
+        match order.side {
+            Side::Bid => {
+                let user_account = self.get_user_account_mut(order.user_id)?;
+                user_account.has_balance_reservation(order.id)?;
+                user_account.balance += order.price * order.remaining;
+                user_account.balance_reservations.remove(&order.id);
+            }
+            Side::Ask => {
+                let position =
+                    self.get_position_for_symbol_mut(order.user_id, order.symbol.clone())?;
+                position.has_position_reservation(order.id)?;
+                position.quantity += order.remaining;
+                position.remove_reservation(order.id);
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn settle_fill(&mut self, trade: &Trade) -> Result<(), AccountsError> {
         match trade.taker_side {
             Side::Bid => {
                 self.consume_reserved_balance(
                     trade.taker_user_id,
                     trade.taker_order_id,
+                    trade.buyer_limit_price,
                     trade.price,
                     trade.quantity,
+                    trade.taker_fully_filled,
                 )?;
                 self.increase_position_quantity_for_symbol(
                     trade.taker_user_id,
@@ -373,6 +348,7 @@ impl AccountsManager {
                     trade.maker_order_id,
                     trade.price,
                     trade.quantity,
+                    trade.maker_fully_filled,
                 )?;
             }
             Side::Ask => {
@@ -382,12 +358,15 @@ impl AccountsManager {
                     trade.taker_order_id,
                     trade.price,
                     trade.quantity,
+                    trade.taker_fully_filled,
                 )?;
                 self.consume_reserved_balance(
                     trade.maker_user_id,
                     trade.maker_order_id,
+                    trade.buyer_limit_price,
                     trade.price,
                     trade.quantity,
+                    trade.maker_fully_filled,
                 )?;
                 self.increase_position_quantity_for_symbol(
                     trade.maker_user_id,

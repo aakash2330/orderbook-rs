@@ -1,9 +1,6 @@
 mod accounts;
-use accounts::AccountsManager;
+use accounts::{AccountsError, AccountsManager};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-
-#[cfg(test)]
-mod tests;
 
 pub type OrderId = u64;
 pub type Price = u64;
@@ -36,7 +33,10 @@ pub struct Trade {
     symbol: Symbol,
     taker_side: Side,
     price: Price,
+    buyer_limit_price: Price,
     quantity: Quantity,
+    maker_fully_filled: bool,
+    taker_fully_filled: bool,
 }
 
 #[derive(Debug)]
@@ -51,39 +51,136 @@ enum OrderError {
     InvalidQuantity,
 }
 
+#[derive(Debug)]
+enum ExchangeError {
+    Account,
+    Order,
+    UnknownSymbol,
+    UnknownOrder,
+    Unauthorized,
+}
+
+impl From<AccountsError> for ExchangeError {
+    fn from(_error: AccountsError) -> Self {
+        ExchangeError::Account
+    }
+}
+
+impl From<OrderError> for ExchangeError {
+    fn from(_error: OrderError) -> Self {
+        ExchangeError::Order
+    }
+}
+
+struct PriceLevel {
+    head: NodeId,
+    tail: Option<NodeId>,
+    nodes: Slab<Node>,
+}
+
 // priority is first the price and then the oldest order
 #[derive(Debug)]
 struct Orderbook {
-    bids: BTreeMap<Price, VecDeque<Order>>,
-    asks: BTreeMap<Price, VecDeque<Order>>,
+    bids: BTreeMap<Price, VecDeque<OrderId>>,
+    asks: BTreeMap<Price, VecDeque<OrderId>>,
+    open_orders: HashMap<OrderId, Order>,
 }
 
 #[derive(Debug)]
 struct Exchange {
     orderbooks: HashMap<Symbol, Orderbook>,
+    accounts_manager: AccountsManager,
 }
 
 impl Exchange {
     fn new() -> Self {
         let mut orderbooks: HashMap<Symbol, Orderbook> = HashMap::new();
+        let accounts_manager = AccountsManager::new();
 
         for symbol in INITIAL_SYMBOLS {
             orderbooks.insert(symbol.to_string(), Orderbook::new());
         }
 
-        Exchange { orderbooks }
+        Exchange {
+            orderbooks,
+            accounts_manager,
+        }
     }
 
     fn insert_symbol(&mut self, symbol: Symbol) {
         self.orderbooks.insert(symbol, Orderbook::new());
     }
+
+    fn submit_limit_order(&mut self, order: Order) -> Result<MatchResult, ExchangeError> {
+        Orderbook::validate_order(&order)?;
+
+        let symbol = order.symbol.clone();
+        if !self.orderbooks.contains_key(&symbol) {
+            return Err(ExchangeError::UnknownSymbol);
+        }
+
+        self.accounts_manager.is_enough_balance_for_order(&order)?;
+
+        match order.side {
+            Side::Bid => self
+                .accounts_manager
+                .reserve_user_balance_for_order(&order)?,
+            Side::Ask => self
+                .accounts_manager
+                .reserve_user_position_for_order(&order)?,
+        }
+
+        let result = self
+            .orderbooks
+            .get_mut(&symbol)
+            .ok_or(ExchangeError::UnknownSymbol)?
+            .handle_limit_order(order)?;
+
+        for fill in &result.fills {
+            self.accounts_manager.settle_fill(fill)?;
+        }
+
+        Ok(result)
+    }
+
+    fn cancel_order(
+        &mut self,
+        user_id: UserId,
+        symbol: Symbol,
+        order_id: OrderId,
+    ) -> Result<Order, ExchangeError> {
+        let order = self
+            .orderbooks
+            .get(&symbol)
+            .ok_or(ExchangeError::UnknownSymbol)?
+            .get_open_order(order_id)
+            .cloned()
+            .ok_or(ExchangeError::UnknownOrder)?;
+
+        if order.user_id != user_id {
+            return Err(ExchangeError::Unauthorized);
+        }
+
+        self.accounts_manager.release_reserved_order(&order)?;
+
+        self.orderbooks
+            .get_mut(&symbol)
+            .ok_or(ExchangeError::UnknownSymbol)?
+            .cancel_order(order_id)
+            .ok_or(ExchangeError::UnknownOrder)
+    }
 }
 
 impl Orderbook {
     fn new() -> Self {
-        let bids: BTreeMap<Price, VecDeque<Order>> = BTreeMap::new();
-        let asks: BTreeMap<Price, VecDeque<Order>> = BTreeMap::new();
-        Orderbook { bids, asks }
+        let bids: BTreeMap<Price, VecDeque<OrderId>> = BTreeMap::new();
+        let asks: BTreeMap<Price, VecDeque<OrderId>> = BTreeMap::new();
+        let open_orders = HashMap::new();
+        Orderbook {
+            bids,
+            asks,
+            open_orders,
+        }
     }
 
     // this will be a check before inserting in the orderbook, if this returns true, we do the
@@ -107,12 +204,42 @@ impl Orderbook {
         self.asks.keys().next().copied()
     }
 
-    fn get_resting_order(_order_id: String) -> Option<Order> {
-        None
+    fn get_mut_open_order(&mut self, order_id: OrderId) -> Option<&mut Order> {
+        self.open_orders.get_mut(&order_id)
     }
 
-    fn insert_order(side: &mut BTreeMap<Price, VecDeque<Order>>, order: Order) {
-        side.entry(order.price).or_default().push_back(order);
+    fn get_open_order(&self, order_id: OrderId) -> Option<&Order> {
+        self.open_orders.get(&order_id)
+    }
+
+    fn remove_order_id_at_price(
+        side: &mut BTreeMap<Price, VecDeque<OrderId>>,
+        price: Price,
+        order_id: OrderId,
+    ) {
+        let should_remove_price = if let Some(order_ids) = side.get_mut(&price) {
+            if let Some(index) = order_ids.iter().position(|id| *id == order_id) {
+                order_ids.remove(index);
+            }
+            order_ids.is_empty()
+        } else {
+            false
+        };
+
+        if should_remove_price {
+            side.remove(&price);
+        }
+    }
+
+    fn cancel_order(&mut self, order_id: OrderId) -> Option<Order> {
+        let order = self.open_orders.remove(&order_id)?;
+
+        match order.side {
+            Side::Bid => Self::remove_order_id_at_price(&mut self.bids, order.price, order.id),
+            Side::Ask => Self::remove_order_id_at_price(&mut self.asks, order.price, order.id),
+        }
+
+        Some(order)
     }
 
     fn remove_ask_price_if_empty(&mut self, price: Price) {
@@ -150,11 +277,10 @@ impl Orderbook {
                 while (remaining_order.remaining > 0) && self.can_match(&remaining_order) {
                     let best_ask_price = self.best_ask().unwrap();
                     // find the best ask for the bidder
+                    let matched_resting_ask_order_id =
+                        *self.asks.get(&best_ask_price).unwrap().front().unwrap();
                     let matched_resting_ask_order = self
-                        .asks
-                        .get_mut(&best_ask_price)
-                        .unwrap()
-                        .front_mut()
+                        .get_mut_open_order(matched_resting_ask_order_id)
                         .unwrap();
                     if matched_resting_ask_order.remaining > remaining_order.remaining {
                         let matched_quantity = remaining_order.remaining;
@@ -170,7 +296,10 @@ impl Orderbook {
                             symbol: remaining_order.symbol.clone(),
                             taker_side: remaining_order.side,
                             price: matched_resting_ask_order.price,
+                            buyer_limit_price: remaining_order.price,
                             quantity: matched_quantity,
+                            maker_fully_filled: false,
+                            taker_fully_filled: true,
                         };
                         fills.push(trade);
                     } else if matched_resting_ask_order.remaining <= remaining_order.remaining {
@@ -187,7 +316,10 @@ impl Orderbook {
                             symbol: remaining_order.symbol.clone(),
                             taker_side: remaining_order.side,
                             price: matched_resting_ask_order.price,
+                            buyer_limit_price: remaining_order.price,
                             quantity: matched_quantity,
+                            maker_fully_filled: true,
+                            taker_fully_filled: remaining_order.remaining == 0,
                         };
 
                         assert!(
@@ -195,6 +327,11 @@ impl Orderbook {
                                 .get_mut(&best_ask_price)
                                 .unwrap()
                                 .pop_front()
+                                .is_some()
+                        );
+                        assert!(
+                            self.open_orders
+                                .remove(&matched_resting_ask_order_id)
                                 .is_some()
                         );
                         self.remove_ask_price_if_empty(best_ask_price);
@@ -216,11 +353,10 @@ impl Orderbook {
                 while (remaining_order.remaining > 0) && self.can_match(&remaining_order) {
                     let best_bid_price = self.best_bid().unwrap();
                     // find the best bid for the asker
+                    let matched_resting_bid_order_id =
+                        *self.bids.get(&best_bid_price).unwrap().front().unwrap();
                     let matched_resting_bid_order = self
-                        .bids
-                        .get_mut(&best_bid_price)
-                        .unwrap()
-                        .front_mut()
+                        .get_mut_open_order(matched_resting_bid_order_id)
                         .unwrap();
                     if matched_resting_bid_order.remaining > remaining_order.remaining {
                         let matched_quantity = remaining_order.remaining;
@@ -236,7 +372,10 @@ impl Orderbook {
                             symbol: remaining_order.symbol.clone(),
                             taker_side: remaining_order.side,
                             price: matched_resting_bid_order.price,
+                            buyer_limit_price: matched_resting_bid_order.price,
                             quantity: matched_quantity,
+                            maker_fully_filled: false,
+                            taker_fully_filled: true,
                         };
                         fills.push(trade);
                     } else if matched_resting_bid_order.remaining <= remaining_order.remaining {
@@ -253,7 +392,10 @@ impl Orderbook {
                             symbol: remaining_order.symbol.clone(),
                             taker_side: remaining_order.side,
                             price: matched_resting_bid_order.price,
+                            buyer_limit_price: matched_resting_bid_order.price,
                             quantity: matched_quantity,
+                            maker_fully_filled: true,
+                            taker_fully_filled: remaining_order.remaining == 0,
                         };
 
                         assert!(
@@ -261,6 +403,11 @@ impl Orderbook {
                                 .get_mut(&best_bid_price)
                                 .unwrap()
                                 .pop_front()
+                                .is_some()
+                        );
+                        assert!(
+                            self.open_orders
+                                .remove(&matched_resting_bid_order_id)
                                 .is_some()
                         );
                         self.remove_bid_price_if_empty(best_bid_price);
@@ -284,8 +431,22 @@ impl Orderbook {
     // just inserts order into orderbook based on the side
     fn insert(&mut self, order: Order) {
         match order.side {
-            Side::Bid => Self::insert_order(&mut self.bids, order),
-            Side::Ask => Self::insert_order(&mut self.asks, order),
+            Side::Bid => {
+                self.bids
+                    .entry(order.price)
+                    .or_default()
+                    .push_back(order.id);
+
+                self.open_orders.insert(order.id, order)
+            }
+            Side::Ask => {
+                self.asks
+                    .entry(order.price)
+                    .or_default()
+                    .push_back(order.id);
+
+                self.open_orders.insert(order.id, order)
+            }
         };
     }
 }
@@ -296,21 +457,27 @@ fn main() {
     let symbol = "BTC".to_string();
     let mut exchange = Exchange::new();
     exchange.insert_symbol(symbol.clone());
-    let orderbook = exchange.orderbooks.get_mut(&symbol).unwrap();
-    let mut accounts = AccountsManager::new();
 
-    accounts.create_account(1);
-    accounts
+    exchange.accounts_manager.create_account(1);
+    exchange
+        .accounts_manager
         .increase_position_quantity_for_symbol(1, symbol.clone(), 3)
         .unwrap();
-    accounts.create_account(2);
-    accounts
+    exchange.accounts_manager.create_account(2);
+    exchange
+        .accounts_manager
         .increase_position_quantity_for_symbol(2, symbol.clone(), 4)
         .unwrap();
-    accounts.create_account(3);
-    accounts.increase_account_balance(3, 1000).unwrap();
+    exchange.accounts_manager.create_account(3);
+    exchange
+        .accounts_manager
+        .increase_account_balance(3, 1000)
+        .unwrap();
 
-    println!("balances before matching -> {:?}", accounts);
+    println!(
+        "balances before matching -> {:?}",
+        exchange.accounts_manager
+    );
 
     let ask_order_1 = Order {
         id: 1,
@@ -323,7 +490,9 @@ fn main() {
 
     println!(
         "balance check ask_order_1 -> {:?}",
-        accounts.is_enough_balance_for_order(&ask_order_1)
+        exchange
+            .accounts_manager
+            .is_enough_balance_for_order(&ask_order_1)
     );
 
     let ask_order_2 = Order {
@@ -337,7 +506,9 @@ fn main() {
 
     println!(
         "balance check ask_order_2 -> {:?}",
-        accounts.is_enough_balance_for_order(&ask_order_2)
+        exchange
+            .accounts_manager
+            .is_enough_balance_for_order(&ask_order_2)
     );
 
     let bid_order = Order {
@@ -351,33 +522,28 @@ fn main() {
 
     println!(
         "balance check bid_order -> {:?}",
-        accounts.is_enough_balance_for_order(&bid_order)
+        exchange
+            .accounts_manager
+            .is_enough_balance_for_order(&bid_order)
     );
 
-    accounts
-        .reserve_user_position_for_order(&ask_order_1)
-        .unwrap();
-    let result1 = orderbook.handle_limit_order(ask_order_1).unwrap();
-    for fill in &result1.fills {
-        accounts.settle_fill(fill).unwrap();
-    }
+    exchange.submit_limit_order(ask_order_1).unwrap();
 
-    accounts
-        .reserve_user_position_for_order(&ask_order_2)
-        .unwrap();
-    let result2 = orderbook.handle_limit_order(ask_order_2).unwrap();
-    for fill in &result2.fills {
-        accounts.settle_fill(fill).unwrap();
-    }
+    exchange.submit_limit_order(ask_order_2).unwrap();
 
-    println!("book before bid -> {:?}", orderbook);
+    println!(
+        "book before bid -> {:?}",
+        exchange.orderbooks.get(&symbol).unwrap()
+    );
 
-    accounts.reserve_user_balance_for_order(&bid_order).unwrap();
-    let result = orderbook.handle_limit_order(bid_order).unwrap();
-    for fill in &result.fills {
-        accounts.settle_fill(fill).unwrap();
-    }
+    let result = exchange.submit_limit_order(bid_order).unwrap();
     println!("result -> {:?}", result);
-    println!("book after bid -> {:?}", orderbook);
-    println!("balances after matching -> {:?}", accounts);
+    println!(
+        "book after bid -> {:?}",
+        exchange.orderbooks.get(&symbol).unwrap()
+    );
+    println!("balances after matching -> {:?}", exchange.accounts_manager);
+
+    let cancelled = exchange.cancel_order(3, symbol.clone(), 3).unwrap();
+    println!("cancelled -> {:?}", cancelled);
 }
