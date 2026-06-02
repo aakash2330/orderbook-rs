@@ -1,6 +1,8 @@
 mod accounts;
+mod price_level;
 use accounts::{AccountsError, AccountsManager};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use price_level::PriceLevel;
+use std::collections::{BTreeMap, HashMap};
 
 pub type OrderId = u64;
 pub type Price = u64;
@@ -72,17 +74,11 @@ impl From<OrderError> for ExchangeError {
     }
 }
 
-struct PriceLevel {
-    head: NodeId,
-    tail: Option<NodeId>,
-    nodes: Slab<Node>,
-}
-
 // priority is first the price and then the oldest order
 #[derive(Debug)]
 struct Orderbook {
-    bids: BTreeMap<Price, VecDeque<OrderId>>,
-    asks: BTreeMap<Price, VecDeque<OrderId>>,
+    bids: BTreeMap<Price, PriceLevel>,
+    asks: BTreeMap<Price, PriceLevel>,
     open_orders: HashMap<OrderId, Order>,
 }
 
@@ -173,8 +169,8 @@ impl Exchange {
 
 impl Orderbook {
     fn new() -> Self {
-        let bids: BTreeMap<Price, VecDeque<OrderId>> = BTreeMap::new();
-        let asks: BTreeMap<Price, VecDeque<OrderId>> = BTreeMap::new();
+        let bids: BTreeMap<Price, PriceLevel> = BTreeMap::new();
+        let asks: BTreeMap<Price, PriceLevel> = BTreeMap::new();
         let open_orders = HashMap::new();
         Orderbook {
             bids,
@@ -213,45 +209,66 @@ impl Orderbook {
     }
 
     fn remove_order_id_at_price(
-        side: &mut BTreeMap<Price, VecDeque<OrderId>>,
+        side: &mut BTreeMap<Price, PriceLevel>,
         price: Price,
         order_id: OrderId,
-    ) {
-        let should_remove_price = if let Some(order_ids) = side.get_mut(&price) {
-            if let Some(index) = order_ids.iter().position(|id| *id == order_id) {
-                order_ids.remove(index);
+    ) -> Option<()> {
+        let should_remove_price = {
+            let price_level = side.get_mut(&price)?;
+
+            if price_level.len() == 1 {
+                if price_level.front().ok()? != order_id {
+                    return None;
+                }
+                true
+            } else {
+                price_level.delete(order_id).ok()?;
+                false
             }
-            order_ids.is_empty()
-        } else {
-            false
         };
 
         if should_remove_price {
             side.remove(&price);
         }
+
+        Some(())
     }
 
     fn cancel_order(&mut self, order_id: OrderId) -> Option<Order> {
-        let order = self.open_orders.remove(&order_id)?;
+        let order = self.open_orders.get(&order_id)?.clone();
 
         match order.side {
-            Side::Bid => Self::remove_order_id_at_price(&mut self.bids, order.price, order.id),
-            Side::Ask => Self::remove_order_id_at_price(&mut self.asks, order.price, order.id),
+            Side::Bid => Self::remove_order_id_at_price(&mut self.bids, order.price, order.id)?,
+            Side::Ask => Self::remove_order_id_at_price(&mut self.asks, order.price, order.id)?,
         }
 
-        Some(order)
+        self.open_orders.remove(&order_id)
     }
 
-    fn remove_ask_price_if_empty(&mut self, price: Price) {
-        if self.asks.get(&price).unwrap().is_empty() {
-            self.asks.remove(&price);
-        };
-    }
+    fn pop_front_order_id_at_price(
+        side: &mut BTreeMap<Price, PriceLevel>,
+        price: Price,
+    ) -> Option<OrderId> {
+        let should_remove_price;
+        let order_id;
 
-    fn remove_bid_price_if_empty(&mut self, price: Price) {
-        if self.bids.get(&price).unwrap().is_empty() {
-            self.bids.remove(&price);
-        };
+        {
+            let price_level = side.get_mut(&price)?;
+
+            if price_level.len() == 1 {
+                order_id = price_level.front().ok()?;
+                should_remove_price = true;
+            } else {
+                order_id = price_level.pop_front().ok()?;
+                should_remove_price = false;
+            }
+        }
+
+        if should_remove_price {
+            side.remove(&price);
+        }
+
+        Some(order_id)
     }
 
     fn validate_order(order: &Order) -> Result<(), OrderError> {
@@ -278,7 +295,7 @@ impl Orderbook {
                     let best_ask_price = self.best_ask().unwrap();
                     // find the best ask for the bidder
                     let matched_resting_ask_order_id =
-                        *self.asks.get(&best_ask_price).unwrap().front().unwrap();
+                        self.asks.get(&best_ask_price).unwrap().front().unwrap();
                     let matched_resting_ask_order = self
                         .get_mut_open_order(matched_resting_ask_order_id)
                         .unwrap();
@@ -322,19 +339,15 @@ impl Orderbook {
                             taker_fully_filled: remaining_order.remaining == 0,
                         };
 
-                        assert!(
-                            self.asks
-                                .get_mut(&best_ask_price)
-                                .unwrap()
-                                .pop_front()
-                                .is_some()
+                        assert_eq!(
+                            Self::pop_front_order_id_at_price(&mut self.asks, best_ask_price),
+                            Some(matched_resting_ask_order_id)
                         );
                         assert!(
                             self.open_orders
                                 .remove(&matched_resting_ask_order_id)
                                 .is_some()
                         );
-                        self.remove_ask_price_if_empty(best_ask_price);
                         fills.push(trade);
                     };
                 }
@@ -354,7 +367,7 @@ impl Orderbook {
                     let best_bid_price = self.best_bid().unwrap();
                     // find the best bid for the asker
                     let matched_resting_bid_order_id =
-                        *self.bids.get(&best_bid_price).unwrap().front().unwrap();
+                        self.bids.get(&best_bid_price).unwrap().front().unwrap();
                     let matched_resting_bid_order = self
                         .get_mut_open_order(matched_resting_bid_order_id)
                         .unwrap();
@@ -398,19 +411,15 @@ impl Orderbook {
                             taker_fully_filled: remaining_order.remaining == 0,
                         };
 
-                        assert!(
-                            self.bids
-                                .get_mut(&best_bid_price)
-                                .unwrap()
-                                .pop_front()
-                                .is_some()
+                        assert_eq!(
+                            Self::pop_front_order_id_at_price(&mut self.bids, best_bid_price),
+                            Some(matched_resting_bid_order_id)
                         );
                         assert!(
                             self.open_orders
                                 .remove(&matched_resting_bid_order_id)
                                 .is_some()
                         );
-                        self.remove_bid_price_if_empty(best_bid_price);
                         fills.push(trade);
                     };
                 }
@@ -432,18 +441,24 @@ impl Orderbook {
     fn insert(&mut self, order: Order) {
         match order.side {
             Side::Bid => {
+                let order_id = order.id;
                 self.bids
                     .entry(order.price)
-                    .or_default()
-                    .push_back(order.id);
+                    .and_modify(|price_level| {
+                        price_level.push_back(order_id).unwrap();
+                    })
+                    .or_insert_with(|| PriceLevel::new(order_id));
 
                 self.open_orders.insert(order.id, order)
             }
             Side::Ask => {
+                let order_id = order.id;
                 self.asks
                     .entry(order.price)
-                    .or_default()
-                    .push_back(order.id);
+                    .and_modify(|price_level| {
+                        price_level.push_back(order_id).unwrap();
+                    })
+                    .or_insert_with(|| PriceLevel::new(order_id));
 
                 self.open_orders.insert(order.id, order)
             }
